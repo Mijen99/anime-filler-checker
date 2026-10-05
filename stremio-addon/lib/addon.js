@@ -21,17 +21,37 @@ try {
 /* ═══════════════════════════════════════════════════
  *  ADDON MANIFEST
  * ═══════════════════════════════════════════════════ */
+
+// Optional: your metadata addon's manifest URL (e.g. AIOMetadata). When set,
+// episode lists come from it (with badges added) instead of Cinemeta/Kitsu.
+const META_UPSTREAM = (process.env.AFC_META_UPSTREAM || "")
+  .trim()
+  .replace(/\/manifest\.json$/i, "")
+  .replace(/\/+$/, "");
+const META_SOURCES = {
+  tt: "https://v3-cinemeta.strem.io",
+  kitsu: "https://anime-kitsu.strem.fun",
+};
+const META_TYPES = ["series", "anime", "anime.series"];
+const META_ID_PREFIXES = META_UPSTREAM
+  ? ["tt", "kitsu:", "mal:", "anilist:", "anidb:", "tvdb:", "tmdb:", "tvmaze:"]
+  : ["tt", "kitsu:"];
+
 const manifest = {
   id: "community.animefiller",
-  version: "1.3.0",
+  version: "1.4.0",
   name: "Anime Filler Checker",
   description:
     "Detects filler, canon, mixed, and anime-canon episodes for anime series. " +
     "Shows filler status on episode thumbnails and in the stream list so you know before you hit play. " +
     "Visit animefillerchecker.com for more info and gain access to browser extensions.",
   logo: "https://animefillerchecker.com/icon128.png",
-  resources: ["meta", "subtitles", "stream"],
-  types: ["series"],
+  resources: [
+    { name: "meta", types: META_TYPES, idPrefixes: META_ID_PREFIXES },
+    "subtitles",
+    "stream",
+  ],
+  types: ["series", "anime"],
   catalogs: [],
   idPrefixes: ["tt", "kitsu:"],
   config: [
@@ -287,16 +307,19 @@ async function resolveAbsoluteEpisode(seriesId, season, episode) {
 /* ═══════════════════════════════════════════════════
  *  META HANDLER — Filler badges on episode thumbnails
  *
- *  Takes the normal series details (Cinemeta for tt IDs, the Kitsu addon
- *  for kitsu: IDs), and swaps each episode thumbnail for a badged version.
- *  For anything that isn't an anime on AnimeFillerList it returns "not
- *  found", so Stremio falls back to your other metadata addons.
+ *  Gets the normal series details from your metadata addon, swaps each
+ *  episode thumbnail for a badged version, and passes it on.
+ *
+ *  Where the details come from:
+ *   • AFC_META_UPSTREAM set (e.g. your AIOMetadata manifest URL) → that addon,
+ *     so you keep its descriptions, ratings and artwork.
+ *   • Otherwise → Cinemeta for tt IDs, the Kitsu addon for kitsu: IDs.
+ *
+ *  For anything that isn't an anime on AnimeFillerList it answers "not
+ *  found", so Stremio / Nuvio fall back to your next metadata addon.
  * ═══════════════════════════════════════════════════ */
 
-const META_SOURCES = {
-  tt: "https://v3-cinemeta.strem.io",
-  kitsu: "https://anime-kitsu.strem.fun",
-};
+const ANIME_ONLY_PREFIXES = ["kitsu:", "mal:", "anilist:", "anidb:"];
 const META_CACHE_TTL = 1000 * 60 * 60 * 6; // 6 hours
 const metaCache = new Map();
 
@@ -312,55 +335,101 @@ function setPublicBaseUrl(url) {
 
 function notFound(reason) {
   const err = new Error(reason);
-  err.noHandler = true; // SDK answers 404 → Stremio uses the next addon
+  err.noHandler = true; // SDK answers 404 → the app uses the next addon
   return err;
 }
 
-async function fetchBaseMeta(id) {
-  const cached = metaCache.get(id);
+async function fetchBaseMeta(type, id) {
+  const key = `${type}/${id}`;
+  const cached = metaCache.get(key);
   if (cached && Date.now() - cached.ts < META_CACHE_TTL) return cached.meta;
 
-  const source = id.startsWith("kitsu:") ? META_SOURCES.kitsu : META_SOURCES.tt;
+  let url;
+  if (META_UPSTREAM) {
+    url = `${META_UPSTREAM}/meta/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
+  } else {
+    const source = id.startsWith("kitsu:") ? META_SOURCES.kitsu : META_SOURCES.tt;
+    url = `${source}/meta/series/${encodeURIComponent(id)}.json`;
+  }
+
   let meta = null;
   try {
-    const res = await fetch(`${source}/meta/series/${encodeURIComponent(id)}.json`, { timeout: 8000 });
+    const res = await fetch(url, { timeout: 9000 });
     if (res.ok) meta = (await res.json()).meta || null;
   } catch {}
-  metaCache.set(id, { meta, ts: Date.now() });
+  metaCache.set(key, { meta, ts: Date.now() });
   return meta;
 }
 
-function looksLikeAnime(meta, id) {
-  if (id.startsWith("kitsu:")) return true;
-  if (imdbIds[id]) return true;
+function looksLikeAnime(meta, id, type) {
+  if (type !== "series") return true; // "anime" / "anime.series"
+  if (ANIME_ONLY_PREFIXES.some((p) => id.startsWith(p))) return true;
+  if (imdbIds[id] || (meta.imdb_id && imdbIds[meta.imdb_id])) return true;
   const genres = (meta.genres || meta.genre || []).map((g) => String(g).toLowerCase());
   const country = String(meta.country || "").toLowerCase();
-  return genres.includes("animation") || genres.includes("anime") || country.includes("japan");
+  return (
+    genres.includes("animation") ||
+    genres.includes("anime") ||
+    country.includes("japan") ||
+    !!meta.mal_id ||
+    !!meta.kitsu_id
+  );
+}
+
+/**
+ * Work out the absolute episode number (the numbering AnimeFillerList uses)
+ * for each video in the list.
+ */
+async function mapAbsoluteEpisodes(meta, id) {
+  const imdbId = meta.imdb_id || (id.startsWith("tt") ? id.split(":")[0] : null);
+  const absolute = new Map();
+
+  // 1. Use IMDb season/episode where the metadata gives it, numbered the same
+  //    way as the stream badges (Cinemeta order).
+  if (imdbId) {
+    for (const v of meta.videos) {
+      let s = v.imdbSeason, e = v.imdbEpisode;
+      if ((!s || !e) && typeof v.id === "string" && v.id.startsWith(imdbId + ":")) {
+        const parts = v.id.split(":");
+        s = parseInt(parts[1], 10);
+        e = parseInt(parts[2], 10);
+      }
+      if (s > 0 && e > 0) absolute.set(v.id, await resolveAbsoluteEpisode(imdbId, s, e));
+    }
+  }
+
+  // 2. Otherwise count through the list in season/episode order
+  //    (kitsu:/mal: lists are already numbered 1..N).
+  meta.videos
+    .filter((v) => v.season > 0 && v.episode > 0)
+    .sort((a, b) => a.season - b.season || a.episode - b.episode)
+    .forEach((v, i) => {
+      if (!absolute.has(v.id)) absolute.set(v.id, i + 1);
+    });
+
+  return { absolute, imdbId };
 }
 
 builder.defineMetaHandler(async ({ type, id, config }) => {
-  if (MAINTENANCE_MODE || type !== "series") throw notFound("unsupported");
+  if (MAINTENANCE_MODE || !META_TYPES.includes(type)) throw notFound("unsupported");
 
-  const base = await fetchBaseMeta(id);
+  const base = await fetchBaseMeta(type, id);
   if (!base || !Array.isArray(base.videos) || !base.videos.length) throw notFound("no meta");
-  if (!looksLikeAnime(base, id)) throw notFound("not anime");
+  if (!looksLikeAnime(base, id, type)) throw notFound("not anime");
 
-  const animeName = id.startsWith("tt") ? imdbIds[id] || base.name : base.name;
-  if (!animeName) throw notFound("no name");
+  const { absolute, imdbId } = await mapAbsoluteEpisodes(base, id);
 
-  const fillerData = await fetchFillerData(animeName).catch(() => null);
-  if (!fillerData || !fillerData.totalEpisodes) throw notFound("no filler data");
-
-  // Map each video to its absolute episode number (same logic as the stream handler)
-  const absolute = new Map();
-  if (id.startsWith("kitsu:")) {
-    for (const v of base.videos) if (v.episode > 0) absolute.set(v.id, v.episode);
-  } else {
-    base.videos
-      .filter((v) => v.season > 0 && v.episode > 0)
-      .sort((a, b) => a.season - b.season || a.episode - b.episode)
-      .forEach((v, i) => absolute.set(v.id, i + 1));
+  // Find the show on AnimeFillerList: try the IMDb title first (covers the
+  // whole series), then the name shown by the metadata addon.
+  let fillerData = null;
+  const names = [];
+  if (imdbId) names.push(await resolveAnimeName(imdbId));
+  names.push(base.name);
+  for (const name of [...new Set(names.filter(Boolean))]) {
+    fillerData = await fetchFillerData(name).catch(() => null);
+    if (fillerData && fillerData.totalEpisodes) break;
   }
+  if (!fillerData || !fillerData.totalEpisodes) throw notFound("no filler data");
 
   const fallbackImage = base.background || base.poster || null;
   let badged = 0;

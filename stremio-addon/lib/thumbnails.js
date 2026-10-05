@@ -37,6 +37,14 @@ const ALLOWED_HOSTS = [
   "trakt.tv",
 ];
 
+// Also allow images hosted by your metadata addon (e.g. AIOMetadata's
+// placeholder and blurred-thumbnail images).
+try {
+  if (process.env.AFC_META_UPSTREAM) {
+    ALLOWED_HOSTS.push(new URL(process.env.AFC_META_UPSTREAM.trim()).hostname.toLowerCase());
+  }
+} catch {}
+
 const pillBuffers = {};
 for (const [type, b64] of Object.entries(PILLS)) {
   pillBuffers[type] = Buffer.from(b64, "base64");
