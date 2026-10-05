@@ -15,7 +15,7 @@ const PILLS = require("./badgePills");
 
 const WIDTH = 640;
 const HEIGHT = 360;
-const MARGIN = 16;
+const MARGIN = 12;
 const MAX_SOURCE_BYTES = 6 * 1024 * 1024;
 
 // Only fetch thumbnails from known image hosts so this can't be used as an
@@ -84,26 +84,43 @@ async function renderThumbnail(type, src) {
   const pill = pillBuffers[type];
   if (!pill) return null;
 
-  const pillMeta = await sharp(pill).metadata();
-  const left = WIDTH - pillMeta.width - MARGIN;
+  const { width: pw, height: ph } = await sharp(pill).metadata();
+  const left = WIDTH - pw - MARGIN;
   const top = MARGIN;
 
-  let base;
+  let baseBuf = null;
   const source = await loadSource(src);
   if (source) {
     try {
-      base = sharp(source).resize(WIDTH, HEIGHT, { fit: "cover", position: "centre" });
-      // Force decode now so a broken image falls back to the blank background
-      base = sharp(await base.toBuffer());
+      baseBuf = await sharp(source)
+        .resize(WIDTH, HEIGHT, { fit: "cover", position: "centre" })
+        .removeAlpha()
+        .toBuffer();
     } catch {
-      base = null;
+      baseBuf = null;
     }
   }
-  if (!base) base = blankBackground();
+  if (!baseBuf) baseBuf = await blankBackground().png().toBuffer();
 
-  return base
-    .composite([{ input: pill, left, top }])
-    .jpeg({ quality: 82, mozjpeg: true })
+  // Frosted-glass backdrop: blur the area behind the pill, clipped to its shape
+  const mask = Buffer.from(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${pw}" height="${ph}"><rect width="${pw}" height="${ph}" rx="${ph / 2}" fill="#fff"/></svg>`
+  );
+  const frosted = await sharp(baseBuf)
+    .extract({ left, top, width: pw, height: ph })
+    .blur(9)
+    .modulate({ brightness: 0.85, saturation: 1.1 })
+    .ensureAlpha()
+    .composite([{ input: mask, blend: "dest-in" }])
+    .png()
+    .toBuffer();
+
+  return sharp(baseBuf)
+    .composite([
+      { input: frosted, left, top },
+      { input: pill, left, top },
+    ])
+    .jpeg({ quality: 84, mozjpeg: true })
     .toBuffer();
 }
 
@@ -137,8 +154,11 @@ async function handleThumbRequest(req, res) {
   return true;
 }
 
+// Bump when the badge design changes so apps fetch the new images
+const BADGE_STYLE = "2";
+
 function buildThumbUrl(baseUrl, type, src) {
-  const q = src ? `?src=${encodeURIComponent(src)}` : "";
+  const q = `?v=${BADGE_STYLE}` + (src ? `&src=${encodeURIComponent(src)}` : "");
   return `${baseUrl}/thumb/${type}.jpg${q}`;
 }
 
