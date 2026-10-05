@@ -39,7 +39,7 @@ const META_ID_PREFIXES = META_UPSTREAM
 
 const manifest = {
   id: "community.animefiller",
-  version: "1.4.1",
+  version: "1.4.3",
   name: "Anime Filler Checker",
   description:
     "Detects filler, canon, mixed, and anime-canon episodes for anime series. " +

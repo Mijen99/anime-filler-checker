@@ -13,9 +13,12 @@ const fetch = require("node-fetch");
 const sharp = require("sharp");
 const PILLS = require("./badgePills");
 
-const WIDTH = 640;
-const HEIGHT = 360;
-const MARGIN = 12;
+const WIDTH = 1280;
+const HEIGHT = 720;
+// The badge sits top-centre: that's the only spot every app/layout shows.
+// Nuvio's wide cards trim the sides, its list view crops to a centred square,
+// and it puts its own watched tick top-right and episode number top-left.
+const TOP_INSET = Math.round(HEIGHT * 0.07);
 const MAX_SOURCE_BYTES = 6 * 1024 * 1024;
 
 // Only fetch thumbnails from known image hosts so this can't be used as an
@@ -45,9 +48,13 @@ try {
   }
 } catch {}
 
+const SHADOW = PILLS.SHADOW || 0;
 const pillBuffers = {};
-for (const [type, b64] of Object.entries(PILLS)) {
-  pillBuffers[type] = Buffer.from(b64, "base64");
+const pillSizes = {};
+for (const [type, entry] of Object.entries(PILLS)) {
+  if (!entry || typeof entry !== "object") continue;
+  pillBuffers[type] = Buffer.from(entry.png, "base64");
+  pillSizes[type] = { w: entry.w, h: entry.h };
 }
 
 function isAllowedSource(src) {
@@ -84,16 +91,16 @@ async function renderThumbnail(type, src) {
   const pill = pillBuffers[type];
   if (!pill) return null;
 
-  const { width: pw, height: ph } = await sharp(pill).metadata();
-  const left = WIDTH - pw - MARGIN;
-  const top = MARGIN;
+  const { w: pw, h: ph } = pillSizes[type];
+  const left = Math.round((WIDTH - pw) / 2);
+  const top = TOP_INSET;
 
   let baseBuf = null;
   const source = await loadSource(src);
   if (source) {
     try {
       baseBuf = await sharp(source)
-        .resize(WIDTH, HEIGHT, { fit: "cover", position: "centre" })
+        .resize(WIDTH, HEIGHT, { fit: "cover", position: "centre", kernel: "lanczos3" })
         .removeAlpha()
         .toBuffer();
     } catch {
@@ -108,8 +115,8 @@ async function renderThumbnail(type, src) {
   );
   const frosted = await sharp(baseBuf)
     .extract({ left, top, width: pw, height: ph })
-    .blur(9)
-    .modulate({ brightness: 0.85, saturation: 1.1 })
+    .blur(14)
+    .modulate({ brightness: 0.8, saturation: 1.15 })
     .ensureAlpha()
     .composite([{ input: mask, blend: "dest-in" }])
     .png()
@@ -118,9 +125,9 @@ async function renderThumbnail(type, src) {
   return sharp(baseBuf)
     .composite([
       { input: frosted, left, top },
-      { input: pill, left, top },
+      { input: pill, left: left - SHADOW, top: top - SHADOW },
     ])
-    .jpeg({ quality: 84, mozjpeg: true })
+    .jpeg({ quality: 86, mozjpeg: true, chromaSubsampling: "4:4:4" })
     .toBuffer();
 }
 
@@ -155,7 +162,7 @@ async function handleThumbRequest(req, res) {
 }
 
 // Bump when the badge design changes so apps fetch the new images
-const BADGE_STYLE = "2";
+const BADGE_STYLE = "4";
 
 function buildThumbUrl(baseUrl, type, src) {
   const q = `?v=${BADGE_STYLE}` + (src ? `&src=${encodeURIComponent(src)}` : "");
