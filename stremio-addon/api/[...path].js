@@ -6,6 +6,7 @@
 
 const { getRouter } = require("stremio-addon-sdk");
 const builder = require("../lib/addon");
+const { handleThumbRequest } = require("../lib/thumbnails");
 
 const MAINTENANCE_STREAM = JSON.stringify({
   streams: [{
@@ -19,7 +20,7 @@ const MAINTENANCE_SUBTITLES = JSON.stringify({ subtitles: [] });
 const addonInterface = builder.getInterface();
 const router = getRouter(addonInterface);
 
-module.exports = (req, res) => {
+module.exports = async (req, res) => {
   // Set CORS headers (required by Stremio addon protocol)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "*");
@@ -31,6 +32,16 @@ module.exports = (req, res) => {
   }
 
   const reqPath = req.url || "";
+
+  // Remember our public address so episode thumbnails can link back here
+  const host = req.headers["x-forwarded-host"] || req.headers.host;
+  if (host) {
+    const proto = req.headers["x-forwarded-proto"] || (/^(localhost|127\.0\.0\.1)(:|$)/.test(host) ? "http" : "https");
+    builder.setPublicBaseUrl(`${proto}://${host}`);
+  }
+
+  // Badged episode thumbnails: /thumb/<type>.jpg?src=...
+  if (/\/thumb\//.test(reqPath) && (await handleThumbRequest(req, res))) return;
 
   // Maintenance mode: intercept early, serve cached static response
   if (builder.MAINTENANCE_MODE && /\/(stream|subtitles)\//.test(reqPath)) {

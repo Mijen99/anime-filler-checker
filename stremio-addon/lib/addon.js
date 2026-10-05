@@ -8,6 +8,7 @@ const {
 } = require("./fillerData");
 const { generateSubtitle, SHORT_LABELS } = require("./subtitles");
 const { kvGet, kvSet } = require("./kvCache");
+const { buildThumbUrl } = require("./thumbnails");
 
 const fetch = require("node-fetch");
 
@@ -22,14 +23,14 @@ try {
  * ═══════════════════════════════════════════════════ */
 const manifest = {
   id: "community.animefiller",
-  version: "1.2.2",
+  version: "1.3.0",
   name: "Anime Filler Checker",
   description:
     "Detects filler, canon, mixed, and anime-canon episodes for anime series. " +
-    "Shows filler status in the stream list so you know before you hit play. " +
+    "Shows filler status on episode thumbnails and in the stream list so you know before you hit play. " +
     "Visit animefillerchecker.com for more info and gain access to browser extensions.",
   logo: "https://animefillerchecker.com/icon128.png",
-  resources: ["subtitles", "stream"],
+  resources: ["meta", "subtitles", "stream"],
   types: ["series"],
   catalogs: [],
   idPrefixes: ["tt", "kitsu:"],
@@ -284,6 +285,105 @@ async function resolveAbsoluteEpisode(seriesId, season, episode) {
 }
 
 /* ═══════════════════════════════════════════════════
+ *  META HANDLER — Filler badges on episode thumbnails
+ *
+ *  Takes the normal series details (Cinemeta for tt IDs, the Kitsu addon
+ *  for kitsu: IDs), and swaps each episode thumbnail for a badged version.
+ *  For anything that isn't an anime on AnimeFillerList it returns "not
+ *  found", so Stremio falls back to your other metadata addons.
+ * ═══════════════════════════════════════════════════ */
+
+const META_SOURCES = {
+  tt: "https://v3-cinemeta.strem.io",
+  kitsu: "https://anime-kitsu.strem.fun",
+};
+const META_CACHE_TTL = 1000 * 60 * 60 * 6; // 6 hours
+const metaCache = new Map();
+
+let publicBaseUrl =
+  process.env.AFC_BASE_URL ||
+  (process.env.VERCEL_PROJECT_PRODUCTION_URL
+    ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
+    : `http://127.0.0.1:${process.env.PORT || 7000}`);
+
+function setPublicBaseUrl(url) {
+  if (url && !process.env.AFC_BASE_URL) publicBaseUrl = url.replace(/\/+$/, "");
+}
+
+function notFound(reason) {
+  const err = new Error(reason);
+  err.noHandler = true; // SDK answers 404 → Stremio uses the next addon
+  return err;
+}
+
+async function fetchBaseMeta(id) {
+  const cached = metaCache.get(id);
+  if (cached && Date.now() - cached.ts < META_CACHE_TTL) return cached.meta;
+
+  const source = id.startsWith("kitsu:") ? META_SOURCES.kitsu : META_SOURCES.tt;
+  let meta = null;
+  try {
+    const res = await fetch(`${source}/meta/series/${encodeURIComponent(id)}.json`, { timeout: 8000 });
+    if (res.ok) meta = (await res.json()).meta || null;
+  } catch {}
+  metaCache.set(id, { meta, ts: Date.now() });
+  return meta;
+}
+
+function looksLikeAnime(meta, id) {
+  if (id.startsWith("kitsu:")) return true;
+  if (imdbIds[id]) return true;
+  const genres = (meta.genres || meta.genre || []).map((g) => String(g).toLowerCase());
+  const country = String(meta.country || "").toLowerCase();
+  return genres.includes("animation") || genres.includes("anime") || country.includes("japan");
+}
+
+builder.defineMetaHandler(async ({ type, id, config }) => {
+  if (MAINTENANCE_MODE || type !== "series") throw notFound("unsupported");
+
+  const base = await fetchBaseMeta(id);
+  if (!base || !Array.isArray(base.videos) || !base.videos.length) throw notFound("no meta");
+  if (!looksLikeAnime(base, id)) throw notFound("not anime");
+
+  const animeName = id.startsWith("tt") ? imdbIds[id] || base.name : base.name;
+  if (!animeName) throw notFound("no name");
+
+  const fillerData = await fetchFillerData(animeName).catch(() => null);
+  if (!fillerData || !fillerData.totalEpisodes) throw notFound("no filler data");
+
+  // Map each video to its absolute episode number (same logic as the stream handler)
+  const absolute = new Map();
+  if (id.startsWith("kitsu:")) {
+    for (const v of base.videos) if (v.episode > 0) absolute.set(v.id, v.episode);
+  } else {
+    base.videos
+      .filter((v) => v.season > 0 && v.episode > 0)
+      .sort((a, b) => a.season - b.season || a.episode - b.episode)
+      .forEach((v, i) => absolute.set(v.id, i + 1));
+  }
+
+  const fallbackImage = base.background || base.poster || null;
+  let badged = 0;
+  const videos = base.videos.map((v) => {
+    const abs = absolute.get(v.id);
+    const ep = abs && fillerData.episodes[abs];
+    if (!ep || !TYPE_EMOJI[ep.type] || ep.type === "unknown") return v;
+    if (!shouldShowVerdict(config, ep.type)) return v;
+    badged++;
+    return { ...v, thumbnail: buildThumbUrl(publicBaseUrl, ep.type, v.thumbnail || fallbackImage) };
+  });
+
+  if (!badged) throw notFound("no matching episodes");
+
+  return {
+    meta: { ...base, videos },
+    cacheMaxAge: 60 * 60 * 6,
+    staleRevalidate: 60 * 60 * 24,
+    staleError: 60 * 60 * 24 * 7,
+  };
+});
+
+/* ═══════════════════════════════════════════════════
  *  SUBTITLES HANDLER
  * ═══════════════════════════════════════════════════ */
 builder.defineSubtitlesHandler(async ({ type, id, config }) => {
@@ -421,3 +521,4 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
 
 module.exports = builder;
 module.exports.MAINTENANCE_MODE = MAINTENANCE_MODE;
+module.exports.setPublicBaseUrl = setPublicBaseUrl;

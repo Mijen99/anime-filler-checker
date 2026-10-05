@@ -2,15 +2,15 @@
  * Anime Filler Checker — Stremio Addon (Local Server)
  *
  * For local development: `node index.js`
- * For Vercel: see api/addon.js
+ * For Vercel: see api/[...path].js
  */
 
-const { serveHTTP } = require("stremio-addon-sdk");
-const builder = require("./lib/addon");
+const http = require("http");
+const handler = require("./api/[...path].js");
 
 const PORT = process.env.PORT || 7000;
 
-serveHTTP(builder.getInterface(), { port: PORT });
+http.createServer(handler).listen(PORT);
 
 console.log(`
 ╔═══════════════════════════════════════════════════════╗
@@ -23,7 +23,7 @@ console.log(`
 ║  http://localhost:${PORT}/manifest.json                  ║
 ║                                                       ║
 ║  Features:                                            ║
-║  • Episode descriptions show filler/canon status      ║
+║  • Filler/canon badges on episode thumbnails          ║
 ║  • Subtitle track with filler badge notification      ║
 ║  • Filler statistics per show                         ║
 ║  • MAL scores and metadata                            ║
